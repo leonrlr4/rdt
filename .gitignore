@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# Local development log — notes to self, not part of the plugin.
+DEVLOG.md
