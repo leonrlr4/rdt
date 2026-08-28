@@ -1,0 +1,982 @@
+#!/usr/bin/python3
+"""Fetch Reddit data for the Omarchy bar using the browser's logged-in session.
+
+Reads Reddit auth material out of a Chromium-family cookie store, then talks to
+Reddit as that session. Two auth paths, tried in order:
+
+  1. `token_v2` as a Bearer token against oauth.reddit.com. This is the OAuth
+     access token Reddit's own web client uses. Cleanest JSON, explicit
+     X-Ratelimit headers (100 requests / 10 min). Lives 24h; the browser
+     renews it while you browse.
+  2. `reddit_session` as a cookie against www.reddit.com/*.json. Coarser, but
+     the cookie lives ~6 months, so the plugin keeps working through weeks of
+     not opening Reddit in the browser.
+
+Anonymous access is not a fallback: www.reddit.com/*.json answers 403 without
+auth, and the anonymous .rss feed is capped at one request per 60 seconds,
+which is too tight to drive a bar widget.
+
+Absolutely no secret is ever written to disk or to stdout. Tokens live in
+process memory for the lifetime of one run.
+
+stdout is always a single JSON object. Failures are values, not tracebacks:
+{"ok": false, "error": "<code>", "message": "<human text>"} so the QML side can
+branch on a stable code instead of parsing prose.
+"""
+
+import argparse
+import base64
+import hashlib
+import html
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.parse import quote
+
+# A Chrome-ish UA. Reddit serves the JSON endpoints to browser sessions; a
+# bot-looking UA on a cookie-authenticated request is the fastest way to get
+# flagged.
+UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/140.0 Safari/537.36")
+
+# Only these two are ever decrypted. Decrypting the whole reddit jar would cost
+# an openssl spawn per cookie and put more secrets in memory for no gain.
+WANTED_COOKIES = ("token_v2", "reddit_session")
+
+# config dir -> the `application` attribute that browser stores its
+# "Safe Storage" key under in the Secret Service.
+BROWSERS = (
+    ("chromium", "~/.config/chromium", "chromium"),
+    ("chrome", "~/.config/google-chrome", "chrome"),
+    ("brave", "~/.config/BraveSoftware/Brave-Browser", "brave"),
+    ("vivaldi", "~/.config/vivaldi", "vivaldi"),
+    ("edge", "~/.config/microsoft-edge", "microsoft-edge"),
+)
+
+# Chromium's Linux cookie encryption: AES-128-CBC, key = PBKDF2-SHA1 of the
+# Safe Storage password with a fixed salt and *one* iteration (macOS uses
+# 1003 -- do not "fix" this), IV = 16 spaces.
+KDF_SALT = b"saltysalt"
+KDF_ITERATIONS = 1
+KDF_KEYLEN = 16
+AES_IV = b" " * 16
+
+# Used when no keyring is available; Chromium falls back to it and marks the
+# value v10 instead of v11.
+PLAINTEXT_FALLBACK_PASSWORD = b"peanuts"
+
+# Chrome 130+ prefixes the decrypted value with a 32-byte SHA-256 of the domain.
+DOMAIN_HASH_LEN = 32
+
+SEEN_CAP = 500  # ids retained in the seen file; older ones fall off
+
+
+class FetchError(Exception):
+    """An expected failure with a stable code for the QML side to branch on."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+# --------------------------------------------------------------------------
+# cookie store
+# --------------------------------------------------------------------------
+
+def keyring_password(application):
+    """The browser's Safe Storage password, or None if the keyring is locked."""
+    try:
+        p = subprocess.run(["secret-tool", "lookup", "application", application],
+                           capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout or None
+
+
+def derive_key(password):
+    return hashlib.pbkdf2_hmac("sha1", password, KDF_SALT,
+                               KDF_ITERATIONS, KDF_KEYLEN)
+
+
+def unpad(data):
+    """Strip PKCS#7 padding, tolerating values that carry none."""
+    if not data:
+        return data
+    pad = data[-1]
+    if 0 < pad <= 16 and data[-pad:] == bytes([pad]) * pad:
+        return data[:-pad]
+    return data
+
+
+def decrypt_value(blob, key):
+    """Decrypt one v10/v11 Chromium cookie value. Returns None if it isn't one."""
+    if not blob[:3] in (b"v10", b"v11"):
+        return None
+    try:
+        p = subprocess.run(
+            ["openssl", "enc", "-d", "-aes-128-cbc", "-nopad",
+             "-K", key.hex(), "-iv", AES_IV.hex()],
+            input=blob[3:], capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = unpad(p.stdout)
+    if not out:
+        return None
+    try:
+        return out.decode()
+    except UnicodeDecodeError:
+        # Chrome 130+ domain-hash prefix.
+        try:
+            return out[DOMAIN_HASH_LEN:].decode()
+        except UnicodeDecodeError:
+            return None
+
+
+def cookie_db_paths(config_dir):
+    """Every profile's cookie DB under a browser config dir, Default first."""
+    root = os.path.expanduser(config_dir)
+    if not os.path.isdir(root):
+        return []
+    found = []
+    for entry in sorted(os.listdir(root)):
+        path = os.path.join(root, entry, "Cookies")
+        if os.path.isfile(path):
+            found.append(path)
+    found.sort(key=lambda p: os.path.basename(os.path.dirname(p)) != "Default")
+    return found
+
+
+def read_reddit_cookies(db_path):
+    """Raw (name, encrypted_value) rows for the two cookies we care about."""
+    # Chromium holds a lock on the live DB; copy before opening.
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = os.path.join(tmp, "Cookies")
+        try:
+            shutil.copyfile(db_path, copy)
+            db = sqlite3.connect(copy)
+            # Built by concatenation, not %-formatting: the LIKE pattern
+            # contains literal % signs.
+            placeholders = ",".join("?" * len(WANTED_COOKIES))
+            rows = db.execute(
+                "select name, encrypted_value from cookies "
+                "where host_key like '%reddit%' and name in ("
+                + placeholders + ")",
+                WANTED_COOKIES).fetchall()
+            db.close()
+        except (OSError, sqlite3.Error):
+            return []
+    return rows
+
+
+def load_session(browser=None):
+    """Find a browser profile with usable Reddit auth.
+
+    Returns (browser_name, {cookie_name: value}). Raises FetchError with a code
+    describing which step failed, because "it didn't work" is the single most
+    common thing that happens here and the UI needs to say something useful.
+    """
+    candidates = [b for b in BROWSERS if browser in (None, b[0])]
+    if not candidates:
+        raise FetchError("no_browser", "Unknown browser %r" % browser)
+
+    saw_profile = False
+    saw_cookies = False
+    keyring_failed = False
+
+    for name, config_dir, keyring_app in candidates:
+        paths = cookie_db_paths(config_dir)
+        if not paths:
+            continue
+        saw_profile = True
+
+        password = keyring_password(keyring_app)
+        keys = []
+        if password:
+            keys.append(derive_key(password))
+        # Chromium without a usable keyring encrypts with a known constant.
+        keys.append(derive_key(PLAINTEXT_FALLBACK_PASSWORD))
+        if not password:
+            keyring_failed = True
+
+        for path in paths:
+            rows = read_reddit_cookies(path)
+            if rows:
+                saw_cookies = True
+            for key in keys:
+                jar = {}
+                for cookie_name, blob in rows:
+                    value = decrypt_value(blob, key)
+                    if value:
+                        jar[cookie_name] = value
+                if jar:
+                    return name, jar
+
+    if not saw_profile:
+        raise FetchError(
+            "no_browser",
+            "No Chromium-family browser profile found. Log in to Reddit in "
+            "Chromium, Chrome, Brave, Vivaldi or Edge.")
+    if not saw_cookies:
+        raise FetchError(
+            "not_logged_in",
+            "Browser found, but it holds no Reddit session. Log in to Reddit "
+            "in that browser.")
+    if keyring_failed:
+        raise FetchError(
+            "keyring_locked",
+            "Cannot read the browser's encryption key. Unlock your keyring "
+            "(gnome-keyring / kwallet) and try again.")
+    raise FetchError(
+        "decrypt_failed",
+        "Reddit cookies found but could not be decrypted.")
+
+
+# --------------------------------------------------------------------------
+# auth selection
+# --------------------------------------------------------------------------
+
+def token_expiry(token):
+    """`exp` out of the token_v2 JWT payload, or None.
+
+    Only the payload is read, and only its expiry claim -- this is a locally
+    decodable, unsigned base64 segment, so knowing whether the token is stale
+    costs no network round-trip and no signature verification.
+    """
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except (IndexError, ValueError, TypeError):
+        return None
+    exp = claims.get("exp")
+    return float(exp) if isinstance(exp, (int, float)) else None
+
+
+def token_is_fresh(token, now=None, skew=300):
+    """True if the token has more than `skew` seconds left.
+
+    The margin matters: a token that expires mid-request produces a 401 that
+    looks exactly like being logged out.
+    """
+    exp = token_expiry(token)
+    if exp is None:
+        return False
+    return exp - (time.time() if now is None else now) > skew
+
+
+def build_request(path, jar, now=None):
+    """(url, curl header args) for one API path, picking the better auth path."""
+    token = jar.get("token_v2")
+    if token and token_is_fresh(token, now=now):
+        return ("https://oauth.reddit.com" + path,
+                ["-H", "Authorization: Bearer " + token])
+    if jar.get("reddit_session"):
+        base, _, query = path.partition("?")
+        url = "https://www.reddit.com" + base + ".json"
+        if query:
+            url += "?" + query
+        cookie = "; ".join("%s=%s" % kv for kv in sorted(jar.items()))
+        return (url, ["-H", "Cookie: " + cookie])
+    raise FetchError(
+        "auth_expired",
+        "Your browser's Reddit session has expired. Open Reddit in your "
+        "browser to refresh it.")
+
+
+# --------------------------------------------------------------------------
+# http
+# --------------------------------------------------------------------------
+
+def curl(url, headers, timeout=20):
+    """GET one URL, returning parsed JSON. curl handles TLS so this script
+    never imports urllib -- that import alone costs ~66ms of the ~100ms budget
+    for an entire poll."""
+    argv = ["curl", "-sS", "--compressed", "--max-time", str(timeout),
+            "-A", UA, "-w", "\n%{http_code}", *headers, url]
+    try:
+        p = subprocess.run(argv, capture_output=True, timeout=timeout + 5)
+    except (OSError, subprocess.TimeoutExpired):
+        raise FetchError("offline", "Could not reach Reddit.")
+
+    body, _, status = p.stdout.rpartition(b"\n")
+    try:
+        code = int(status)
+    except ValueError:
+        raise FetchError("offline", "Could not reach Reddit.")
+
+    if code in (401, 403):
+        raise FetchError(
+            "auth_expired",
+            "Reddit rejected the browser session. Open Reddit in your browser "
+            "to sign in again.")
+    if code == 429:
+        raise FetchError("rate_limited", "Reddit is rate limiting; backing off.")
+    if code >= 400:
+        raise FetchError("http_error", "Reddit returned HTTP %d." % code)
+    try:
+        return json.loads(body)
+    except ValueError:
+        raise FetchError("http_error", "Reddit returned an unreadable response.")
+
+
+def fetch_many(requests_, timeout=20):
+    """Issue several GETs concurrently.
+
+    Feeds are independent, so the wall time of a poll is one round trip rather
+    than N. Each entry is (key, url, headers); the result maps key -> parsed
+    JSON or a FetchError instance, so one dead feed cannot sink the others.
+    """
+    procs = []
+    for key, url, headers in requests_:
+        argv = ["curl", "-sS", "--compressed", "--max-time", str(timeout),
+                "-A", UA, "-w", "\n%{http_code}", *headers, url]
+        try:
+            procs.append((key, subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                                stderr=subprocess.DEVNULL)))
+        except OSError:
+            procs.append((key, None))
+
+    results = {}
+    for key, proc in procs:
+        if proc is None:
+            results[key] = FetchError("offline", "Could not reach Reddit.")
+            continue
+        try:
+            out = proc.communicate(timeout=timeout + 5)[0]
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            results[key] = FetchError("offline", "Could not reach Reddit.")
+            continue
+        body, _, status = out.rpartition(b"\n")
+        try:
+            code = int(status)
+        except ValueError:
+            results[key] = FetchError("offline", "Could not reach Reddit.")
+            continue
+        if code in (401, 403):
+            results[key] = FetchError("auth_expired", "Reddit rejected the session.")
+        elif code == 429:
+            results[key] = FetchError("rate_limited", "Reddit is rate limiting.")
+        elif code >= 400:
+            results[key] = FetchError("http_error", "HTTP %d" % code)
+        else:
+            try:
+                results[key] = json.loads(body)
+            except ValueError:
+                results[key] = FetchError("http_error", "Unreadable response.")
+    return results
+
+
+# --------------------------------------------------------------------------
+# normalization
+# --------------------------------------------------------------------------
+
+def clean_thumbnail(post):
+    """A usable image URL, or "". Reddit puts sentinels in `thumbnail`."""
+    thumb = post.get("thumbnail") or ""
+    if thumb in ("self", "default", "nsfw", "spoiler", "image", ""):
+        return ""
+    return thumb
+
+
+# Reddit sends CommonMark, and the panel renders it with Text.MarkdownText, so
+# the syntax is left completely intact. Only two things are touched: media URLs
+# that the panel draws as pictures instead, and bare URLs long enough to wrap
+# into a wall of query string.
+_BARE_MEDIA = re.compile(
+    r"^[ \t]*<?https?://\S+?\.(?:png|jpe?g|gif|webp|mp4)(?:\?\S*)?>?[ \t]*\n?",
+    re.MULTILINE | re.IGNORECASE)
+_REDD_MEDIA = re.compile(
+    r"^[ \t]*<?https?://(?:preview|i|v)\.redd\.it/\S+>?[ \t]*\n?",
+    re.MULTILINE | re.IGNORECASE)
+# Bare only: a URL already inside [label](...) is invisible once rendered.
+_LONG_URL = re.compile(r"(?<![(\[])\bhttps?://([^\s/)]+)/[^\s)]{40,}")
+_BLANKS = re.compile(r"\n{3,}")
+# Trims blank lines off both ends without touching the first line's own
+# indentation -- str.strip() would eat it, and four leading spaces is what
+# makes a line a code block.
+_LEADING_BLANKS = re.compile(r"\A(?:[ \t]*\n)+")
+_TRAILING_BLANKS = re.compile(r"(?:\n[ \t]*)+\Z|[ \t]+\Z")
+_FENCE = re.compile(r"^\s*(?:```|~~~)")
+# Block elements that already end a line on their own; a hard break after one
+# is noise at best.
+_SELF_BREAKING = re.compile(r"^\s{0,3}(?:[-*+]\s|\d+[.)]\s|#{1,6}\s|>)")
+
+
+def readable_text(raw):
+    """Markdown, kept as Markdown.
+
+    Reddit's own text is left alone so the renderer can do its job. What comes
+    out is still Markdown, not prose -- the two edits here remove things the
+    renderer would turn into noise rather than formatting.
+    """
+    text = str(raw or "").replace("\u00a0", " ")
+    text = _BARE_MEDIA.sub("", text)
+    text = _REDD_MEDIA.sub("", text)
+    text = _LONG_URL.sub("\\1/…", text)
+    text = _BLANKS.sub("\n\n", text)
+    text = _TRAILING_BLANKS.sub("", _LEADING_BLANKS.sub("", text))
+    return hard_breaks(text)
+
+def hard_breaks(text):
+    """Make Reddit's single newlines survive a CommonMark renderer.
+
+    Reddit breaks a line wherever the author pressed enter. CommonMark folds a
+    lone newline into a space, so a comment written as several short lines
+    arrives as one run-on paragraph. Two trailing spaces is CommonMark's own
+    hard break, and restores the shape the author wrote.
+
+    Left alone inside fenced code, where newlines are already literal, and on
+    indented lines, which are code blocks for the same reason.
+    """
+    lines = text.split("\n")
+    fenced = False
+    out = []
+    for i, line in enumerate(lines):
+        if _FENCE.match(line):
+            fenced = not fenced
+            out.append(line)
+            continue
+        following = lines[i + 1] if i + 1 < len(lines) else ""
+        needs_break = (not fenced
+                       and line.strip() != ""
+                       and following.strip() != ""
+                       and not line.endswith("  ")
+                       and not line.startswith("    ")
+                       and not _SELF_BREAKING.match(line))
+        out.append(line + "  " if needs_break else line)
+    return "\n".join(out)
+
+
+# Reddit writes an inline comment GIF as ![gif](giphy|ID) -- an id, not a URL.
+# A Markdown renderer draws a broken-image icon where the GIF should be, which
+# is exactly what the panel showed. The embeds are lifted out of the text and
+# drawn as real images instead, at a width the panel picks rather than whatever
+# the original happens to be.
+_MD_IMAGE = re.compile(r"!\[([^\]\n]*)\]\(([^)\s]+)\)")
+
+# 200px wide: about 12KB for a GIF that is 40KB at full size, and already
+# narrower than the panel.
+GIPHY_RENDITION = "200w.gif"
+
+
+def media_embed(target, metadata):
+    """One Markdown image target -> a drawable URL, or None.
+
+    `metadata` is the comment's own `media_metadata`, which resolves Reddit's
+    hosted uploads. It answers "invalid" for giphy, whose ids are public and
+    resolve directly.
+    """
+    if target.startswith("giphy|"):
+        # Some ids carry a further "|downsized" rendition hint. Feeding it into
+        # the URL earns a 403 -- only the id itself belongs there.
+        giphy_id = target.split("|")[1].strip()
+        if giphy_id:
+            return {"url": "https://media.giphy.com/media/%s/%s"
+                           % (giphy_id, GIPHY_RENDITION), "kind": "gif"}
+        return None
+    if target.startswith("emote|"):
+        # Decorative subreddit stickers with no stable public URL. The alt text
+        # is left in place and nothing is drawn.
+        return None
+
+    entry = (metadata or {}).get(target)
+    if isinstance(entry, dict) and entry.get("status") == "valid":
+        source = entry.get("s")
+        if isinstance(source, dict) and source.get("u"):
+            return {"url": source["u"],
+                    "kind": "gif" if entry.get("e") == "AnimatedImage" else "image"}
+    if target.startswith(("http://", "https://")):
+        return {"url": target, "kind": "image"}
+    return None
+
+
+def extract_media(text, metadata=None):
+    """(text without its image embeds, [{url, kind}])."""
+    found = []
+
+    def take(match):
+        embed = media_embed(match.group(2), metadata)
+        if embed is None:
+            # Nothing drawable. Keep a real caption, but not the generic
+            # placeholder Reddit writes for its own emotes.
+            alt = match.group(1).strip()
+            return "" if alt.lower() in ("", "img", "gif", "image") else alt
+        if embed["url"] not in [m["url"] for m in found]:
+            found.append(embed)
+        return ""
+
+    return _MD_IMAGE.sub(take, text), found
+
+
+# Reddit publishes downscaled renditions beside every image post. The `url` on
+# the post is the full-resolution original, routinely over a megabyte, which is
+# far more than a bar panel should pull down to draw a 400px-wide picture.
+PREVIEW_TARGET_WIDTH = 640
+
+
+def preview_image(post):
+    """The smallest published rendition at least as wide as we will draw it."""
+    try:
+        image = post["preview"]["images"][0]
+    except (KeyError, IndexError, TypeError):
+        return None
+    options = [r for r in (image.get("resolutions") or [])
+               if isinstance(r, dict) and r.get("url")]
+    options.sort(key=lambda r: r.get("width") or 0)
+    for option in options:
+        if (option.get("width") or 0) >= PREVIEW_TARGET_WIDTH:
+            return option
+    if options:
+        return options[-1]
+    source = image.get("source")
+    return source if isinstance(source, dict) and source.get("url") else None
+
+
+def gallery_images(post, target_width=PREVIEW_TARGET_WIDTH):
+    """Every picture in a Reddit gallery post.
+
+    A gallery carries no `preview` at all; its pictures live in `gallery_data`
+    paired with `media_metadata`, and the listing endpoints strip both. The
+    comments endpoint returns them, which is where the reading view gets its
+    copy of the post -- so a gallery shows nothing in a list row and everything
+    once opened.
+    """
+    items = (post.get("gallery_data") or {}).get("items") or []
+    metadata = post.get("media_metadata") or {}
+    out = []
+    for item in items:
+        entry = metadata.get(item.get("media_id"))
+        if not isinstance(entry, dict) or entry.get("status") != "valid":
+            continue
+        chosen = None
+        for rendition in sorted([r for r in (entry.get("p") or []) if r.get("u")],
+                                key=lambda r: r.get("x") or 0):
+            chosen = rendition
+            if (rendition.get("x") or 0) >= target_width:
+                break
+        if chosen is None:
+            source = entry.get("s")
+            if isinstance(source, dict) and source.get("u"):
+                chosen = source
+        if chosen:
+            out.append({"url": chosen["u"],
+                        "width": chosen.get("x", 0),
+                        "height": chosen.get("y", 0)})
+    return out
+
+
+def post_images(post):
+    """Pictures to draw for a post: the whole gallery, or the single preview.
+
+    One list so the panel has one thing to iterate; a gallery is simply a post
+    with more than one.
+    """
+    gallery = gallery_images(post)
+    if gallery:
+        return gallery
+    preview = preview_image(post)
+    if preview and preview.get("url"):
+        return [{"url": preview["url"],
+                 "width": preview.get("width", 0),
+                 "height": preview.get("height", 0)}]
+    return []
+
+
+def link_domain(post):
+    """Where a link post points, or "" for a text post.
+
+    Worth carrying because a subreddit can switch media off -- r/linux has --
+    and then Reddit returns no thumbnail, no preview and no post_hint for any
+    of its posts. The domain is the one thing left that says where a row goes.
+    """
+    if post.get("is_self"):
+        return ""
+    domain = str(post.get("domain") or "")
+    return "" if domain.startswith("self.") else domain
+
+
+def normalize_post(raw):
+    post = raw.get("data", raw)
+    selftext, selftext_media = extract_media(post.get("selftext") or "",
+                                             post.get("media_metadata"))
+    selftext = readable_text(selftext)
+    return {
+        "media": selftext_media,
+        "id": post.get("id", ""),
+        "title": post.get("title", ""),
+        "subreddit": post.get("subreddit", ""),
+        "author": post.get("author", ""),
+        "score": post.get("score", 0),
+        "comments": post.get("num_comments", 0),
+        "created": post.get("created_utc", 0),
+        "permalink": "https://www.reddit.com" + post.get("permalink", ""),
+        "url": post.get("url", ""),
+        "thumbnail": clean_thumbnail(post),
+        "domain": link_domain(post),
+        "images": post_images(post),
+        "isVideo": bool(post.get("is_video")),
+        "isGallery": bool(post.get("is_gallery")),
+        "selftext": selftext[:2000],
+        "stickied": bool(post.get("stickied")),
+        # None when you have not voted, True upvoted, False downvoted. Present
+        # only because the request is authenticated as you.
+        "liked": post.get("likes"),
+        "saved": bool(post.get("saved")),
+        "authorId": post.get("author_fullname") or "",
+        "over18": bool(post.get("over_18")),
+    }
+
+
+def normalize_listing(payload):
+    children = payload.get("data", {}).get("children", [])
+    return [normalize_post(c) for c in children if c.get("kind") == "t3"]
+
+
+def normalize_comment(raw, depth=0):
+    data = raw.get("data", {})
+    body, media = extract_media(data.get("body") or "",
+                                data.get("media_metadata"))
+    body = readable_text(body)
+    return {
+        "media": media,
+        "id": data.get("id", ""),
+        "author": data.get("author", ""),
+        "score": data.get("score", 0),
+        "created": data.get("created_utc", 0),
+        "body": body[:4000],
+        "depth": depth,
+        "liked": data.get("likes"),
+        "saved": bool(data.get("saved")),
+        "authorId": data.get("author_fullname") or "",
+        "avatar": "",
+    }
+
+
+def flatten_comments(payload, max_depth=3, limit=50):
+    """Comment forest -> a flat list carrying depth, which is what a narrow
+    bar panel can actually render."""
+    try:
+        children = payload[1]["data"]["children"]
+    except (IndexError, KeyError, TypeError):
+        return []
+
+    out = []
+
+    def walk(nodes, depth):
+        for node in nodes:
+            if len(out) >= limit:
+                return
+            if node.get("kind") != "t1":
+                continue
+            out.append(normalize_comment(node, depth))
+            replies = node.get("data", {}).get("replies")
+            if depth + 1 < max_depth and isinstance(replies, dict):
+                walk(replies.get("data", {}).get("children", []), depth + 1)
+
+    walk(children, 0)
+    return out
+
+
+def normalize_subreddit(raw):
+    data = raw.get("data", raw)
+    return {
+        "name": data.get("display_name", ""),
+        "title": (data.get("title") or "")[:120],
+        "description": " ".join((data.get("public_description") or "").split())[:200],
+        "subscribers": data.get("subscribers") or 0,
+        "over18": bool(data.get("over18")),
+    }
+
+
+def normalize_search(payload):
+    """Subreddits worth offering, most subscribed first.
+
+    User profile pages come back from this endpoint as u_<name> subreddits.
+    They are not places you would pin as a tab, so they are dropped.
+    """
+    children = payload.get("data", {}).get("children", [])
+    out = []
+    for child in children:
+        data = child.get("data", {})
+        if data.get("subreddit_type") == "user":
+            continue
+        entry = normalize_subreddit(child)
+        if entry["name"]:
+            out.append(entry)
+    out.sort(key=lambda s: s["subscribers"], reverse=True)
+    return out
+
+
+# --------------------------------------------------------------------------
+# unread state
+# --------------------------------------------------------------------------
+
+def feed_path(feed):
+    """A feed name from settings -> an API path.
+
+    "best" and "home" mean the subscribed front page; anything else is a
+    subreddit, with or without the r/ prefix.
+    """
+    name = feed.strip().strip("/")
+    if name.lower() in ("best", "home", ""):
+        return "/best"
+    if name.lower().startswith("r/"):
+        name = name[2:]
+    return "/r/%s/hot" % name
+
+
+def load_seen(path):
+    """Post ids already shown, oldest first.
+
+    Order is load-bearing, so this is a list and not a set: the cap below
+    evicts from the front, and that is only "drop the oldest" if insertion
+    order survives a round trip. A missing or corrupt file means "nothing seen
+    yet" -- never a crash, because this file is a cache.
+    """
+    try:
+        with open(os.path.expanduser(path)) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    ids = data.get("seen") if isinstance(data, dict) else data
+    return [i for i in ids if isinstance(i, str)] if isinstance(ids, list) else []
+
+
+def save_seen(path, ids):
+    """Write the seen list atomically, dropping the oldest beyond the cap.
+
+    This is a cache file and deliberately NOT part of `settings`: settings are
+    serialized into ~/.config/omarchy/shell.json, which the shell hot-reloads
+    on write. Storing per-poll read state there would make the plugin restart
+    itself every few minutes.
+    """
+    path = os.path.expanduser(path)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    payload = {"seen": list(ids)[-SEEN_CAP:], "updated": time.time()}
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(payload, fh)
+    os.replace(tmp, path)
+
+
+def unread_ids(posts, seen):
+    """New post ids, deduplicated, in first-seen order.
+
+    Feeds overlap: a post from a subreddit you subscribe to appears both in
+    its own feed and on /best. Counting the rows instead of the distinct posts
+    inflates the unread badge by however much your feeds overlap.
+    """
+    out = []
+    counted = set()
+    for post in posts:
+        pid = post.get("id")
+        if pid and pid not in seen and pid not in counted:
+            counted.add(pid)
+            out.append(pid)
+    return out
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+def cmd_feed(args):
+    browser, jar = load_session(args.browser)
+    feeds = [f for f in (args.feeds or "best").split(",") if f.strip()]
+
+    requests_ = []
+    for feed in feeds:
+        path = "%s?limit=%d&raw_json=1" % (feed_path(feed), args.limit)
+        url, headers = build_request(path, jar)
+        requests_.append((feed, url, headers))
+
+    responses = fetch_many(requests_)
+
+    feed_results = []
+    errors = {}
+    for feed in feeds:
+        payload = responses.get(feed)
+        if isinstance(payload, FetchError):
+            errors[feed] = payload.code
+            feed_results.append({"feed": feed, "error": payload.code,
+                                 "message": payload.message, "posts": []})
+        else:
+            feed_results.append({"feed": feed, "posts": normalize_listing(payload)})
+
+    # Every feed failing the same way is a session problem, not a feed problem;
+    # report it as the whole command failing so the UI shows one clear state.
+    if errors and len(errors) == len(feeds):
+        code = sorted(set(errors.values()))[0]
+        raise FetchError(code, "All feeds failed (%s)." % code)
+
+    seen = set(load_seen(args.seen_file)) if args.seen_file else set()
+    all_posts = [p for r in feed_results for p in r["posts"]]
+    new_ids = unread_ids(all_posts, seen)
+
+    return {
+        "ok": True,
+        "browser": browser,
+        "fetched": time.time(),
+        "unread": len(new_ids),
+        "unreadIds": new_ids,
+        "feeds": feed_results,
+    }
+
+
+# Reddit puts no avatar on a comment, but it will resolve many accounts at
+# once from their t2_ ids. One extra request per thread, rather than one per
+# commenter, which at 40 comments would be most of the rate limit.
+def attach_avatars(comments, jar, post=None):
+    ids = []
+    for item in list(comments) + ([post] if post else []):
+        account = (item or {}).get("authorId")
+        if account and account not in ids:
+            ids.append(account)
+    if not ids:
+        return
+
+    url, headers = build_request(
+        "/api/user_data_by_account_ids?ids=" + ",".join(ids), jar)
+    try:
+        profiles = curl(url, headers)
+    except FetchError:
+        # An avatar is decoration; losing it must not lose the thread.
+        return
+    if not isinstance(profiles, dict):
+        return
+
+    for item in list(comments) + ([post] if post else []):
+        entry = profiles.get((item or {}).get("authorId"))
+        if isinstance(entry, dict) and entry.get("profile_img"):
+            # This endpoint HTML-escapes its URLs regardless of raw_json, and
+            # the &amp; makes the signed query invalid -- Reddit answers 403.
+            item["avatar"] = html.unescape(entry["profile_img"])
+
+
+def cmd_comments(args):
+    _, jar = load_session(args.browser)
+    path = "/comments/%s?limit=%d&depth=%d&sort=%s&raw_json=1" % (
+        args.post_id, args.limit, args.depth, args.sort)
+    url, headers = build_request(path, jar)
+    payload = curl(url, headers)
+    try:
+        post = normalize_post(payload[0]["data"]["children"][0])
+    except (IndexError, KeyError, TypeError):
+        post = None
+    comments = flatten_comments(payload, max_depth=args.depth,
+                                limit=args.limit)
+    if post is not None:
+        post.setdefault("avatar", "")
+    attach_avatars(comments, jar, post)
+    return {"ok": True, "post": post, "comments": comments}
+
+
+def cmd_mark_read(args):
+    seen = load_seen(args.seen_file)
+    known = set(seen)
+    for post_id in args.ids.split(","):
+        post_id = post_id.strip()
+        # Appending only genuinely new ids keeps a re-marked post at its
+        # original position, so re-reading something old cannot push a
+        # different old id off the front of the cap.
+        if post_id and post_id not in known:
+            known.add(post_id)
+            seen.append(post_id)
+    save_seen(args.seen_file, seen)
+    return {"ok": True, "seen": min(len(seen), SEEN_CAP)}
+
+
+def cmd_search(args):
+    _, jar = load_session(args.browser)
+    query = args.query.strip()
+    if not query:
+        return {"ok": True, "subreddits": []}
+    # /subreddits/search rather than the autocomplete endpoint: searching
+    # "neovim" here also surfaces r/vim and r/unixporn, which is the point of
+    # looking for a subreddit you cannot already name.
+    path = "/subreddits/search?q=%s&limit=%d&raw_json=1" % (
+        quote(query, safe=""), args.limit)
+    url, headers = build_request(path, jar)
+    return {"ok": True, "subreddits": normalize_search(curl(url, headers))}
+
+
+def cmd_doctor(args):
+    """Explain the setup without ever revealing a secret."""
+    report = {"ok": True, "browsers": []}
+    for name, config_dir, keyring_app in BROWSERS:
+        paths = cookie_db_paths(config_dir)
+        entry = {"name": name, "profiles": len(paths),
+                 "keyring": bool(keyring_password(keyring_app))}
+        if paths:
+            try:
+                _, jar = load_session(name)
+                entry["cookies"] = sorted(jar)
+                token = jar.get("token_v2")
+                if token:
+                    exp = token_expiry(token)
+                    entry["tokenHoursLeft"] = (
+                        round((exp - time.time()) / 3600, 1) if exp else None)
+            except FetchError as exc:
+                entry["error"] = exc.code
+        report["browsers"].append(entry)
+    return report
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="reddit-fetch")
+    parser.add_argument("--browser", default=None,
+                        help="force a browser instead of auto-detecting")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("feed")
+    p.add_argument("--feeds", default="best",
+                   help="comma-separated: best, r/linux, rust")
+    p.add_argument("--limit", type=int, default=25)
+    p.add_argument("--seen-file", default=None)
+    p.set_defaults(func=cmd_feed)
+
+    p = sub.add_parser("comments")
+    p.add_argument("post_id")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--depth", type=int, default=3)
+    p.add_argument("--sort", default="top")
+    p.set_defaults(func=cmd_comments)
+
+    p = sub.add_parser("mark-read")
+    p.add_argument("--seen-file", required=True)
+    p.add_argument("--ids", default="")
+    p.set_defaults(func=cmd_mark_read)
+
+    p = sub.add_parser("search")
+    p.add_argument("query")
+    p.add_argument("--limit", type=int, default=12)
+    p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("doctor")
+    p.set_defaults(func=cmd_doctor)
+
+    args = parser.parse_args(argv)
+    try:
+        result = args.func(args)
+    except FetchError as exc:
+        json.dump({"ok": False, "error": exc.code, "message": exc.message},
+                  sys.stdout)
+        sys.stdout.write("\n")
+        return 1
+    json.dump(result, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

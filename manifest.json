@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "id": "leonrlr4.rdt",
+  "name": "rdt",
+  "version": "0.1.0",
+  "author": "leonrlr4",
+  "license": "MIT",
+  "description": "Your Reddit feed in the Omarchy bar, read with the session you are already signed in to in your browser. Unread count on the pill, posts and comments in the popup.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "rdt",
+    "description": "Unread count on the bar; feeds, posts and comments in the popup.",
+    "category": "Social",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "feeds": "best",
+      "refreshMinutes": 0,
+      "limit": 25,
+      "browser": "",
+      "hideWhenRead": false,
+      "showImages": true
+    },
+    "schema": [
+      {
+        "key": "feeds",
+        "type": "string",
+        "label": "Feeds",
+        "description": "Comma separated. 'best' is your subscribed front page; anything else is a subreddit, e.g. best, r/omarchy, linux",
+        "defaultValue": "best"
+      },
+      {
+        "key": "refreshMinutes",
+        "type": "number",
+        "label": "Background refresh (minutes)",
+        "description": "0 fetches only when you open the panel \u2014 no background polling at all. Set 2 or more to keep the unread count live between opens.",
+        "defaultValue": 0
+      },
+      {
+        "key": "limit",
+        "type": "number",
+        "label": "Posts per feed",
+        "defaultValue": 25
+      },
+      {
+        "key": "browser",
+        "type": "string",
+        "label": "Browser",
+        "description": "Which browser's Reddit session to use. Leave empty to detect it automatically. One of: chromium, chrome, brave, vivaldi, edge",
+        "defaultValue": ""
+      },
+      {
+        "key": "hideWhenRead",
+        "type": "boolean",
+        "label": "Hide the pill when nothing is unread",
+        "defaultValue": false
+      },
+      {
+        "key": "showImages",
+        "type": "boolean",
+        "label": "Show thumbnails and post images",
+        "description": "Loads Reddit's downscaled renditions, not the originals. Turn off for a text-only panel.",
+        "defaultValue": true
+      }
+    ]
+  }
+}
