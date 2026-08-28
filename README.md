@@ -182,7 +182,10 @@ uses whichever is usable:
    stale token is detected without spending a request.
 2. `reddit_session` as a cookie against `www.reddit.com/*.json`, used when the
    token is stale. This cookie lives about six months, so the plugin keeps
-   working through weeks of not opening Reddit in the browser.
+   working through weeks of not opening Reddit in the browser. That path also
+   needs the headers a browser would send — `Accept`, `Referer` and the
+   `Sec-Fetch-*` set. Reddit answers the cookie alone with 403 and an HTML
+   error page, and the same request with those headers with 200 and JSON.
 
 Anonymous access is not a fallback: `www.reddit.com/*.json` answers 403 without
 auth, and the anonymous `.rss` feed is capped at one request per 60 seconds,
@@ -190,8 +193,11 @@ which is far too tight to drive a bar widget.
 
 ### What this means for you
 
-- **Nothing is written to disk.** Cookies live in the memory of a process that
-  runs for about a second per fetch. `doctor` is careful never to print them.
+- **Nothing is written to disk, and nothing reaches the process list.** Cookies
+  live in the memory of a process that runs for about a second per fetch, and
+  the headers carrying them are passed to curl on stdin rather than in argv,
+  where `/proc/<pid>/cmdline` would expose them to every process on the machine.
+  `doctor` is careful never to print them.
 - **Read only.** The plugin issues GETs. It never votes, comments, saves or
   posts.
 - **It is not the official API.** Driving reddit.com with a browser session
@@ -200,6 +206,29 @@ which is far too tight to drive a bar widget.
   the risk to your account is not zero. Decide for yourself.
 - **Unsandboxed.** Like every Omarchy plugin, this runs inside the shell
   process with your user's permissions.
+
+## Boundaries
+
+Things this plugin deliberately does not do, and the checks that keep it that
+way. Each has tests.
+
+- **Credentials never reach argv.** Headers go to curl over stdin via
+  `--config -`.
+- **Nothing built from a URL reaches a shell.** Opening a link uses an argv
+  vector, and the URL must be absolute `https` with no control characters or
+  spaces before it is passed at all.
+- **Images load only from Reddit's own media hosts.** An allowlist, applied
+  when the response is normalized and again in QML before an `Image` is given
+  a source, since an image source is a request the shell makes on its own.
+- **Reddit text is never markup.** Titles, names and metadata render as plain
+  text; post bodies and comments render as Markdown, with their inline media
+  lifted out and drawn as bounded images rather than fetched by the renderer.
+- **Responses and fields are bounded** before parsing and after: a size cap on
+  the response, and caps on how many posts, comments, media items and search
+  results — and how long a title or body — can cross into the panel.
+- **The read-state cache cannot be redirected.** Opened with `O_NOFOLLOW`,
+  checked to be a regular file this user owns, written `0600` to a fresh file
+  and renamed into place.
 
 ## Read state
 
@@ -229,7 +258,7 @@ under the error.
 ## Development
 
 ```bash
-/usr/bin/python3 tests/test_fetch.py                          # 114 checks
+/usr/bin/python3 tests/test_fetch.py                          # 135 checks
 /usr/lib/qt6/bin/qml -platform offscreen tests/test_model.qml  # 34 checks
 omarchy plugin validate .
 ```

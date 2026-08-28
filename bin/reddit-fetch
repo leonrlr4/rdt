@@ -33,11 +33,12 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 # A Chrome-ish UA. Reddit serves the JSON endpoints to browser sessions; a
 # bot-looking UA on a cookie-authenticated request is the fastest way to get
@@ -48,6 +49,23 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
 # Only these two are ever decrypted. Decrypting the whole reddit jar would cost
 # an openssl spawn per cookie and put more secrets in memory for no gain.
 WANTED_COOKIES = ("token_v2", "reddit_session")
+
+# www.reddit.com serves the .json paths to a browser, and checks that it is
+# talking to one. A request carrying only the session cookie is answered 403
+# with an HTML error page; the same request with these headers is answered 200
+# with JSON. They describe a same-origin fetch from a Reddit page, which is
+# exactly what this is standing in for.
+BROWSER_HEADERS = (
+    "Accept: application/json, text/javascript, */*; q=0.01",
+    "Accept-Language: en-US,en;q=0.9",
+    "Referer: https://www.reddit.com/",
+    "Sec-Fetch-Dest: empty",
+    "Sec-Fetch-Mode: cors",
+    "Sec-Fetch-Site: same-origin",
+    'Sec-Ch-Ua: "Chromium";v="140", "Not=A?Brand";v="24"',
+    "Sec-Ch-Ua-Mobile: ?0",
+    'Sec-Ch-Ua-Platform: "Linux"',
+)
 
 # config dir -> the `application` attribute that browser stores its
 # "Safe Storage" key under in the Secret Service.
@@ -75,6 +93,48 @@ PLAINTEXT_FALLBACK_PASSWORD = b"peanuts"
 DOMAIN_HASH_LEN = 32
 
 SEEN_CAP = 500  # ids retained in the seen file; older ones fall off
+
+# Nothing Reddit returns for these endpoints is close to this. A response that
+# is means something is wrong, and it should not be parsed into memory first.
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+# Hard caps on everything that crosses into the panel. Reddit decides how many
+# items and how much text a response carries; the panel should not.
+MAX_POSTS = 100
+MAX_COMMENTS = 200
+MAX_MEDIA = 8
+MAX_SEARCH_RESULTS = 50
+MAX_TITLE = 400
+MAX_SELFTEXT = 2000
+MAX_COMMENT_BODY = 4000
+MAX_URL = 2048
+
+# Only these hosts may be handed to the panel as an image source. Reddit serves
+# its own media from a known set, and an image URL is a resource the shell
+# fetches without asking, so it is an allowlist rather than a filter.
+ALLOWED_MEDIA_HOSTS = frozenset((
+    "i.redd.it", "preview.redd.it", "external-preview.redd.it", "v.redd.it",
+    "a.thumbs.redditmedia.com", "b.thumbs.redditmedia.com",
+    "styles.redditmedia.com", "thumbs.redditmedia.com",
+    "www.redditstatic.com", "media.giphy.com", "i.giphy.com",
+))
+
+
+def safe_media_url(value):
+    """An https URL on an expected media host, or "".
+
+    Everything the panel draws goes through here. A URL that is not on the
+    list is dropped rather than rendered, so a crafted field cannot make the
+    shell fetch an arbitrary host.
+    """
+    url = str(value or "")
+    if not url.startswith("https://") or len(url) > MAX_URL:
+        return ""
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        return ""
+    return url if host.lower() in ALLOWED_MEDIA_HOSTS else ""
 
 
 class FetchError(Exception):
@@ -276,14 +336,14 @@ def build_request(path, jar, now=None):
     token = jar.get("token_v2")
     if token and token_is_fresh(token, now=now):
         return ("https://oauth.reddit.com" + path,
-                ["-H", "Authorization: Bearer " + token])
+                ["Authorization: Bearer " + token])
     if jar.get("reddit_session"):
         base, _, query = path.partition("?")
         url = "https://www.reddit.com" + base + ".json"
         if query:
             url += "?" + query
         cookie = "; ".join("%s=%s" % kv for kv in sorted(jar.items()))
-        return (url, ["-H", "Cookie: " + cookie])
+        return (url, ["Cookie: " + cookie] + list(BROWSER_HEADERS))
     raise FetchError(
         "auth_expired",
         "Your browser's Reddit session has expired. Open Reddit in your "
@@ -294,22 +354,56 @@ def build_request(path, jar, now=None):
 # http
 # --------------------------------------------------------------------------
 
+def curl_config(headers):
+    """The curl options that must never reach argv.
+
+    A header on the command line is world-readable through
+    /proc/<pid>/cmdline for as long as the process lives, and these headers
+    carry the whole session. curl reads this from stdin via `--config -`,
+    where nothing else on the machine can see it.
+    """
+    lines = []
+    for header in headers:
+        escaped = header.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append('header = "%s"' % escaped)
+    return "\n".join(lines) + "\n"
+
+
+def curl_argv(url, timeout):
+    """Everything that is safe to be seen in the process list."""
+    return ["curl", "-sS", "--config", "-", "--compressed",
+            "--max-time", str(timeout),
+            "--max-filesize", str(MAX_RESPONSE_BYTES),
+            "-A", UA, "-w", "\n%{http_code}", url]
+
+
+def read_response(out):
+    """Split curl's body from the status code it was told to append.
+
+    The size check is a second line of defence: --max-filesize aborts on a
+    declared Content-Length, but a chunked response has none to declare.
+    """
+    body, _, status = out.rpartition(b"\n")
+    if len(body) > MAX_RESPONSE_BYTES:
+        raise FetchError("http_error", "Reddit returned an oversized response.")
+    try:
+        return int(status), body
+    except ValueError:
+        raise FetchError("offline", "Could not reach Reddit.")
+
+
 def curl(url, headers, timeout=20):
     """GET one URL, returning parsed JSON. curl handles TLS so this script
     never imports urllib -- that import alone costs ~66ms of the ~100ms budget
     for an entire poll."""
-    argv = ["curl", "-sS", "--compressed", "--max-time", str(timeout),
-            "-A", UA, "-w", "\n%{http_code}", *headers, url]
     try:
-        p = subprocess.run(argv, capture_output=True, timeout=timeout + 5)
+        p = subprocess.run(curl_argv(url, timeout),
+                           input=curl_config(headers).encode(),
+                           capture_output=True, timeout=timeout + 5)
     except (OSError, subprocess.TimeoutExpired):
         raise FetchError("offline", "Could not reach Reddit.")
 
-    body, _, status = p.stdout.rpartition(b"\n")
-    try:
-        code = int(status)
-    except ValueError:
-        raise FetchError("offline", "Could not reach Reddit.")
+    code, body = read_response(p.stdout)
 
     if code in (401, 403):
         raise FetchError(
@@ -335,30 +429,31 @@ def fetch_many(requests_, timeout=20):
     """
     procs = []
     for key, url, headers in requests_:
-        argv = ["curl", "-sS", "--compressed", "--max-time", str(timeout),
-                "-A", UA, "-w", "\n%{http_code}", *headers, url]
         try:
-            procs.append((key, subprocess.Popen(argv, stdout=subprocess.PIPE,
-                                                stderr=subprocess.DEVNULL)))
+            proc = subprocess.Popen(curl_argv(url, timeout),
+                                    stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
         except OSError:
-            procs.append((key, None))
+            procs.append((key, None, None))
+            continue
+        procs.append((key, proc, curl_config(headers).encode()))
 
     results = {}
-    for key, proc in procs:
+    for key, proc, config in procs:
         if proc is None:
             results[key] = FetchError("offline", "Could not reach Reddit.")
             continue
         try:
-            out = proc.communicate(timeout=timeout + 5)[0]
+            out = proc.communicate(input=config, timeout=timeout + 5)[0]
         except subprocess.TimeoutExpired:
             proc.kill()
             results[key] = FetchError("offline", "Could not reach Reddit.")
             continue
-        body, _, status = out.rpartition(b"\n")
         try:
-            code = int(status)
-        except ValueError:
-            results[key] = FetchError("offline", "Could not reach Reddit.")
+            code, body = read_response(out)
+        except FetchError as exc:
+            results[key] = exc
             continue
         if code in (401, 403):
             results[key] = FetchError("auth_expired", "Reddit rejected the session.")
@@ -383,7 +478,7 @@ def clean_thumbnail(post):
     thumb = post.get("thumbnail") or ""
     if thumb in ("self", "default", "nsfw", "spoiler", "image", ""):
         return ""
-    return thumb
+    return safe_media_url(thumb)
 
 
 # Reddit sends CommonMark, and the panel renders it with Text.MarkdownText, so
@@ -509,7 +604,10 @@ def extract_media(text, metadata=None):
             # placeholder Reddit writes for its own emotes.
             alt = match.group(1).strip()
             return "" if alt.lower() in ("", "img", "gif", "image") else alt
-        if embed["url"] not in [m["url"] for m in found]:
+        embed["url"] = safe_media_url(embed["url"])
+        if not embed["url"]:
+            return ""
+        if len(found) < MAX_MEDIA and embed["url"] not in [m["url"] for m in found]:
             found.append(embed)
         return ""
 
@@ -566,10 +664,13 @@ def gallery_images(post, target_width=PREVIEW_TARGET_WIDTH):
             source = entry.get("s")
             if isinstance(source, dict) and source.get("u"):
                 chosen = source
-        if chosen:
-            out.append({"url": chosen["u"],
+        url = safe_media_url(chosen["u"]) if chosen else ""
+        if url:
+            out.append({"url": url,
                         "width": chosen.get("x", 0),
                         "height": chosen.get("y", 0)})
+        if len(out) >= MAX_MEDIA:
+            break
     return out
 
 
@@ -583,8 +684,9 @@ def post_images(post):
     if gallery:
         return gallery
     preview = preview_image(post)
-    if preview and preview.get("url"):
-        return [{"url": preview["url"],
+    url = safe_media_url(preview.get("url")) if preview else ""
+    if url:
+        return [{"url": url,
                  "width": preview.get("width", 0),
                  "height": preview.get("height", 0)}]
     return []
@@ -611,7 +713,7 @@ def normalize_post(raw):
     return {
         "media": selftext_media,
         "id": post.get("id", ""),
-        "title": post.get("title", ""),
+        "title": (post.get("title") or "")[:MAX_TITLE],
         "subreddit": post.get("subreddit", ""),
         "author": post.get("author", ""),
         "score": post.get("score", 0),
@@ -624,7 +726,7 @@ def normalize_post(raw):
         "images": post_images(post),
         "isVideo": bool(post.get("is_video")),
         "isGallery": bool(post.get("is_gallery")),
-        "selftext": selftext[:2000],
+        "selftext": selftext[:MAX_SELFTEXT],
         "stickied": bool(post.get("stickied")),
         # None when you have not voted, True upvoted, False downvoted. Present
         # only because the request is authenticated as you.
@@ -637,7 +739,8 @@ def normalize_post(raw):
 
 def normalize_listing(payload):
     children = payload.get("data", {}).get("children", [])
-    return [normalize_post(c) for c in children if c.get("kind") == "t3"]
+    posts = [c for c in children if c.get("kind") == "t3"][:MAX_POSTS]
+    return [normalize_post(c) for c in posts]
 
 
 def normalize_comment(raw, depth=0):
@@ -651,7 +754,7 @@ def normalize_comment(raw, depth=0):
         "author": data.get("author", ""),
         "score": data.get("score", 0),
         "created": data.get("created_utc", 0),
-        "body": body[:4000],
+        "body": body[:MAX_COMMENT_BODY],
         "depth": depth,
         "liked": data.get("likes"),
         "saved": bool(data.get("saved")),
@@ -660,7 +763,7 @@ def normalize_comment(raw, depth=0):
     }
 
 
-def flatten_comments(payload, max_depth=3, limit=50):
+def flatten_comments(payload, max_depth=3, limit=MAX_COMMENTS):
     """Comment forest -> a flat list carrying depth, which is what a narrow
     bar panel can actually render."""
     try:
@@ -712,7 +815,7 @@ def normalize_search(payload):
         if entry["name"]:
             out.append(entry)
     out.sort(key=lambda s: s["subscribers"], reverse=True)
-    return out
+    return out[:MAX_SEARCH_RESULTS]
 
 
 # --------------------------------------------------------------------------
@@ -733,6 +836,25 @@ def feed_path(feed):
     return "/r/%s/hot" % name
 
 
+def open_no_symlink(path, flags, mode=0o600):
+    """Open a cache path without following a symlink into somewhere else.
+
+    O_NOFOLLOW refuses the final component if it is a link, and the stat
+    afterwards refuses anything that is not a plain file owned by us. The cache
+    lives under a predictable path, so a link planted there would otherwise let
+    another process choose what this reads, or where it writes.
+    """
+    fd = os.open(path, flags | os.O_NOFOLLOW, mode)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise OSError("not a regular file owned by this user: %s" % path)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
 def load_seen(path):
     """Post ids already shown, oldest first.
 
@@ -742,8 +864,13 @@ def load_seen(path):
     yet" -- never a crash, because this file is a cache.
     """
     try:
-        with open(os.path.expanduser(path)) as fh:
-            data = json.load(fh)
+        fd = open_no_symlink(os.path.expanduser(path), os.O_RDONLY)
+        try:
+            with os.fdopen(fd, "r") as fh:
+                # A cache file this size is not one this program wrote.
+                data = json.loads(fh.read(MAX_RESPONSE_BYTES))
+        except BaseException:
+            raise
     except (OSError, ValueError):
         return []
     ids = data.get("seen") if isinstance(data, dict) else data
@@ -761,12 +888,24 @@ def save_seen(path, ids):
     path = os.path.expanduser(path)
     parent = os.path.dirname(path)
     if parent:
-        os.makedirs(parent, exist_ok=True)
+        os.makedirs(parent, mode=0o700, exist_ok=True)
     payload = {"seen": list(ids)[-SEEN_CAP:], "updated": time.time()}
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(payload, fh)
-    os.replace(tmp, path)
+
+    # Written to a fresh private file and renamed over the target, so a reader never
+    # sees a half-written cache and the mode is never widened by an existing
+    # file. O_EXCL refuses a planted symlink outright.
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def unread_ids(posts, seen):
@@ -860,7 +999,7 @@ def attach_avatars(comments, jar, post=None):
         if isinstance(entry, dict) and entry.get("profile_img"):
             # This endpoint HTML-escapes its URLs regardless of raw_json, and
             # the &amp; makes the signed query invalid -- Reddit answers 403.
-            item["avatar"] = html.unescape(entry["profile_img"])
+            item["avatar"] = safe_media_url(html.unescape(entry["profile_img"]))
 
 
 def cmd_comments(args):

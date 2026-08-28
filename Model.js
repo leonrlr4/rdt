@@ -24,6 +24,38 @@ function parseFeeds(raw) {
     return out.length > 0 ? out : ["best"]
 }
 
+// Is this safe to load as an image?
+//
+// The same allowlist bin/reddit-fetch applies, repeated here so a field that
+// reached the panel some other way still cannot make the shell fetch an
+// arbitrary host. An Image source is a request the shell makes on its own.
+var MEDIA_HOSTS = ["i.redd.it", "preview.redd.it", "external-preview.redd.it",
+                   "v.redd.it", "a.thumbs.redditmedia.com",
+                   "b.thumbs.redditmedia.com", "styles.redditmedia.com",
+                   "thumbs.redditmedia.com", "www.redditstatic.com",
+                   "media.giphy.com", "i.giphy.com"]
+
+function safeMediaUrl(url) {
+    var target = String(url || "")
+    if (target.length === 0 || target.length > 2048) return ""
+    if (target.indexOf("https://") !== 0) return ""
+    var host = target.slice(8).split(/[/?#]/)[0].split("@").pop().split(":")[0]
+    return MEDIA_HOSTS.indexOf(host.toLowerCase()) >= 0 ? target : ""
+}
+
+// Is this safe to hand to xdg-open?
+//
+// Absolute https only. The URL comes from the Reddit API and ends up as an
+// argv element, so the scheme check is what stops file:, javascript: or a
+// bare word reaching the launcher; the argv vector itself is what stops shell
+// metacharacters being executed. Both boundaries, not one.
+function isBrowsableUrl(url) {
+    var target = String(url || "")
+    if (target.length === 0 || target.length > 2048) return false
+    if (/[\x00-\x20"<>\\^`{|}]/.test(target)) return false
+    return /^https:\/\/[A-Za-z0-9._~-]+(:[0-9]+)?([/?#]|$)/.test(target)
+}
+
 // Feed names compare case-insensitively and without their r/ prefix, so
 // pinning "linux" when "r/Linux" is already a tab does not add a second one.
 function feedKey(feed) {

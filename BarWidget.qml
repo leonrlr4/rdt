@@ -1,6 +1,7 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
@@ -186,9 +187,20 @@ BarWidget {
       bar.shell.updateEntryInline(moduleName, entry)
   }
 
+  // Hand a URL to the browser without a shell ever seeing it.
+  //
+  // bar.run() is execDetached, which is `bash -lc <string>` -- so concatenating
+  // an API-supplied URL into it makes any shell metacharacter in that URL
+  // executable. Util.execArgv passes an argv vector through `exec "$@"`, where
+  // the arguments land in positional parameters and are never re-tokenised.
+  // The shell's own Util.qml says to prefer it "for anything built from input".
+  //
+  // The scheme check is the second boundary: only absolute https, so neither
+  // file:, javascript: nor a bare word can be handed to xdg-open.
   function openInBrowser(url) {
-    if (!url) return
-    if (bar && typeof bar.run === "function") bar.run("xdg-open " + url)
+    var target = String(url || "")
+    if (!Model.isBrowsableUrl(target)) return
+    Util.execArgv(["xdg-open", target])
   }
 
   Timer {

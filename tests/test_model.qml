@@ -39,6 +39,52 @@ Item {
   }
 
   Component.onCompleted: {
+    // ---- safeMediaUrl: what the shell may be told to fetch
+    check("a reddit image host passes",
+          Model.safeMediaUrl("https://i.redd.it/a.png"), "https://i.redd.it/a.png")
+    check("a giphy host passes",
+          Model.safeMediaUrl("https://media.giphy.com/media/x/200w.gif"),
+          "https://media.giphy.com/media/x/200w.gif")
+    check("an unknown host is dropped",
+          Model.safeMediaUrl("https://evil.example/a.png"), "")
+    check("http is dropped", Model.safeMediaUrl("http://i.redd.it/a.png"), "")
+    // userinfo before the host is how a URL is made to look like one thing
+    // and resolve to another.
+    check("a userinfo prefix cannot spoof the host",
+          Model.safeMediaUrl("https://i.redd.it@evil.example/a.png"), "")
+    check("a host prefix is not a match",
+          Model.safeMediaUrl("https://i.redd.it.evil.example/a.png"), "")
+    check("empty is dropped", Model.safeMediaUrl(""), "")
+    check("undefined is dropped", Model.safeMediaUrl(undefined), "")
+    check("case is ignored",
+          Model.safeMediaUrl("https://I.Redd.It/a.png"), "https://I.Redd.It/a.png")
+
+    // ---- isBrowsableUrl: what may be handed to xdg-open
+    check("plain https passes",
+          Model.isBrowsableUrl("https://www.reddit.com/r/linux/"), true)
+    check("https with a query passes",
+          Model.isBrowsableUrl("https://e.com/a?b=c"), true)
+    check("http is refused", Model.isBrowsableUrl("http://e.com/"), false)
+    check("file is refused", Model.isBrowsableUrl("file:///etc/passwd"), false)
+    check("javascript is refused",
+          Model.isBrowsableUrl("javascript:alert(1)"), false)
+    check("a bare word is refused", Model.isBrowsableUrl("xdg-open"), false)
+    check("a relative path is refused", Model.isBrowsableUrl("/etc/passwd"), false)
+    check("empty is refused", Model.isBrowsableUrl(""), false)
+    check("undefined is refused", Model.isBrowsableUrl(undefined), false)
+    // Shell metacharacters cannot execute through an argv vector, but a URL
+    // carrying them is not a URL and has no business reaching a launcher.
+    check("a semicolon is refused",
+          Model.isBrowsableUrl("https://e.com/a;rm -rf ~"), false)
+    check("a backtick is refused",
+          Model.isBrowsableUrl("https://e.com/`id`"), false)
+    check("a space is refused", Model.isBrowsableUrl("https://e.com/a b"), false)
+    check("a newline is refused",
+          Model.isBrowsableUrl("https://e.com/a\nhttps://evil"), false)
+    check("scheme-relative is refused", Model.isBrowsableUrl("//e.com/a"), false)
+    check("an over-long url is refused",
+          Model.isBrowsableUrl("https://e.com/" + new Array(2100).join("x")), false)
+
     // ---- feedKey: what makes two feed names the same feed
     check("feedKey strips the prefix", Model.feedKey("r/linux"), "linux")
     check("feedKey lowercases", Model.feedKey("r/Linux"), "linux")

@@ -915,7 +915,7 @@ Panel {
               Image {
                 id: rowThumb
                 visible: root.showImages && modelData.thumbnail !== ""
-                source: visible ? modelData.thumbnail : ""
+                source: visible ? Model.safeMediaUrl(modelData.thumbnail) : ""
                 anchors.right: parent.right
                 anchors.rightMargin: Style.space(8)
                 anchors.verticalCenter: parent.verticalCenter
@@ -1089,7 +1089,7 @@ Panel {
                   id: postAvatar
                   visible: root.showImages && root.openPost
                     && root.openPost.avatar !== ""
-                  source: visible ? root.openPost.avatar : ""
+                  source: visible ? Model.safeMediaUrl(root.openPost.avatar) : ""
                   width: visible ? root.avatarSize : 0
                   height: root.avatarSize
                   anchors.verticalCenter: parent.verticalCenter
@@ -1137,7 +1137,7 @@ Panel {
                   required property var modelData
                   width: Math.min(Style.space(260), readingColumn.width)
                   height: Style.space(190)
-                  source: modelData.url
+                  source: Model.safeMediaUrl(modelData.url)
                   fillMode: Image.PreserveAspectFit
                   horizontalAlignment: Image.AlignLeft
                   asynchronous: true
@@ -1162,7 +1162,7 @@ Panel {
 
                   Image {
                     anchors.fill: parent
-                    source: modelData.url
+                    source: Model.safeMediaUrl(modelData.url)
                     fillMode: Image.PreserveAspectCrop
                     asynchronous: true
                     cache: true
@@ -1290,7 +1290,7 @@ Panel {
                   Image {
                     id: commentAvatar
                     visible: root.showImages && commentRow.modelData.avatar !== ""
-                    source: visible ? commentRow.modelData.avatar : ""
+                    source: visible ? Model.safeMediaUrl(commentRow.modelData.avatar) : ""
                     x: commentRow.indent
                     y: 0
                     width: visible ? root.avatarSize : 0
@@ -1309,20 +1309,10 @@ Panel {
                        + (commentAvatar.visible ? root.avatarSize + Style.space(6) : 0)
                     width: parent.width - x
                     elide: Text.ElideRight
-                    textFormat: Text.StyledText
-                    text: "<font color='" + root.authorText + "'>u/"
-                      + commentRow.modelData.author + "</font>   "
-                      + "<font color='"
-                      + (commentRow.modelData.liked === true ? root.votedText
-                                                             : root.scoreText)
-                      + "'>" + (commentRow.modelData.liked === true
-                                ? "\uf164 " : "\uf062 ")
-                      + Model.compactNumber(commentRow.modelData.score)
-                      + "</font>   "
-                      + Model.relativeTime(commentRow.modelData.created, root.nowMs)
+                    text: "u/" + commentRow.modelData.author
                     font.family: Style.font.family
                     font.pixelSize: Style.font.caption
-                    color: root.textTertiary
+                    color: root.authorText
                   }
 
                   Repeater {
@@ -1343,13 +1333,26 @@ Panel {
                       width: Math.min(Style.space(200),
                                       commentRow.width - commentRow.indent)
                       height: Style.space(150)
-                      source: modelData.url
+                      source: Model.safeMediaUrl(modelData.url)
                       fillMode: Image.PreserveAspectFit
                       horizontalAlignment: Image.AlignLeft
                       asynchronous: true
                       cache: true
                       playing: true
                     }
+                  }
+
+                  Text {
+                    id: commentScore
+                    x: commentByline.x + commentByline.implicitWidth + Style.space(8)
+                    y: commentByline.y
+                    text: (commentRow.modelData.liked === true ? "\uf164 " : "\uf062 ")
+                      + Model.compactNumber(commentRow.modelData.score)
+                      + "   " + Model.relativeTime(commentRow.modelData.created, root.nowMs)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    color: commentRow.modelData.liked === true ? root.votedText
+                                                               : root.textTertiary
                   }
 
                   Text {

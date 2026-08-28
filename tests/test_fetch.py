@@ -89,6 +89,21 @@ class TestAuthSelection(unittest.TestCase):
         self.assertEqual(url, "https://www.reddit.com/best.json?limit=5")
         self.assertTrue(any("Cookie: " in h for h in headers))
 
+    def test_the_cookie_path_carries_browser_headers(self):
+        # www.reddit.com answers a cookie-only request to .json with 403 and an
+        # HTML error page. The same request with these headers is answered 200
+        # with JSON, so the fallback is only a fallback with them.
+        _, headers = rf.build_request("/best", {"reddit_session": "sess"})
+        names = [h.split(":")[0] for h in headers]
+        for required in ("Accept", "Referer", "Sec-Fetch-Mode", "Sec-Fetch-Site"):
+            self.assertIn(required, names)
+
+    def test_the_oauth_path_sends_only_the_bearer(self):
+        # oauth.reddit.com wants an API client, not a browser.
+        _, headers = rf.build_request("/best", {"token_v2": make_token(time.time() + 3600)})
+        self.assertEqual(len(headers), 1)
+        self.assertTrue(headers[0].startswith("Authorization: Bearer "))
+
     def test_cookie_path_inserts_json_before_query(self):
         jar = {"reddit_session": "sess"}
         url, _ = rf.build_request("/r/linux/hot?limit=25&raw_json=1", jar)
@@ -229,6 +244,148 @@ class TestSearch(unittest.TestCase):
 
         self.assertEqual(rf.cmd_search(A())["subreddits"], [])
         self.assertEqual(called, [])
+
+
+class TestSecrecy(unittest.TestCase):
+    """Credentials must not reach argv: /proc/<pid>/cmdline is readable by
+    every process on the machine for as long as curl runs."""
+
+    def test_headers_are_not_in_the_argument_vector(self):
+        argv = rf.curl_argv("https://e.com/x", 20)
+        self.assertNotIn("-H", argv)
+        joined = " ".join(argv)
+        self.assertNotIn("Authorization", joined)
+        self.assertNotIn("Cookie", joined)
+
+    def test_headers_go_into_the_stdin_config(self):
+        config = rf.curl_config(["Authorization: Bearer abc", "Cookie: s=1"])
+        self.assertIn('header = "Authorization: Bearer abc"', config)
+        self.assertIn('header = "Cookie: s=1"', config)
+
+    def test_quotes_in_a_header_cannot_break_the_config(self):
+        config = rf.curl_config(['X: a"b\\c'])
+        self.assertEqual(config.strip(), 'header = "X: a\\"b\\\\c"')
+
+    def test_argv_carries_a_size_limit(self):
+        argv = rf.curl_argv("https://e.com/x", 20)
+        self.assertIn("--max-filesize", argv)
+        self.assertIn(str(rf.MAX_RESPONSE_BYTES), argv)
+
+    def test_an_oversized_body_is_refused_before_parsing(self):
+        huge = b"x" * (rf.MAX_RESPONSE_BYTES + 1) + b"\n200"
+        with self.assertRaises(rf.FetchError) as ctx:
+            rf.read_response(huge)
+        self.assertEqual(ctx.exception.code, "http_error")
+
+    def test_a_normal_body_splits_into_status_and_content(self):
+        self.assertEqual(rf.read_response(b'{"a":1}\n200'), (200, b'{"a":1}'))
+
+
+class TestMediaAllowlist(unittest.TestCase):
+    """An image URL is a request the shell makes without asking, so the hosts
+    it may be pointed at are a list rather than a filter."""
+
+    def test_reddit_hosts_pass(self):
+        for url in ("https://i.redd.it/a.png",
+                    "https://preview.redd.it/a.png?width=640",
+                    "https://styles.redditmedia.com/t5_x/a.png",
+                    "https://media.giphy.com/media/x/200w.gif"):
+            self.assertEqual(rf.safe_media_url(url), url)
+
+    def test_an_unknown_host_is_dropped(self):
+        self.assertEqual(rf.safe_media_url("https://evil.example/a.png"), "")
+
+    def test_http_is_dropped(self):
+        self.assertEqual(rf.safe_media_url("http://i.redd.it/a.png"), "")
+
+    def test_a_userinfo_prefix_cannot_spoof_the_host(self):
+        self.assertEqual(
+            rf.safe_media_url("https://i.redd.it@evil.example/a.png"), "")
+
+    def test_a_host_suffix_is_not_a_match(self):
+        self.assertEqual(
+            rf.safe_media_url("https://i.redd.it.evil.example/a.png"), "")
+
+    def test_empty_and_junk(self):
+        for value in ("", None, "javascript:alert(1)", "not a url"):
+            self.assertEqual(rf.safe_media_url(value), "")
+
+    def test_thumbnails_go_through_it(self):
+        post = rf.normalize_listing({"data": {"children": [{"kind": "t3", "data": {
+            "id": "a", "thumbnail": "https://evil.example/x.png"}}]}})[0]
+        self.assertEqual(post["thumbnail"], "")
+
+    def test_comment_media_goes_through_it(self):
+        meta = {"k": {"status": "valid", "s": {"u": "https://evil.example/x.gif"}}}
+        _, media = rf.extract_media("![img](k)", meta)
+        self.assertEqual(media, [])
+
+
+class TestCaps(unittest.TestCase):
+    """Reddit decides how much a response carries; the panel should not."""
+
+    def test_posts_are_capped(self):
+        payload = {"data": {"children": [
+            {"kind": "t3", "data": {"id": str(i)}}
+            for i in range(rf.MAX_POSTS + 40)]}}
+        self.assertEqual(len(rf.normalize_listing(payload)), rf.MAX_POSTS)
+
+    def test_titles_are_capped(self):
+        post = rf.normalize_listing({"data": {"children": [{"kind": "t3", "data": {
+            "id": "a", "title": "x" * 900}}]}})[0]
+        self.assertEqual(len(post["title"]), rf.MAX_TITLE)
+
+    def test_search_results_are_capped(self):
+        payload = {"data": {"children": [
+            {"data": {"display_name": "s%d" % i, "subscribers": i}}
+            for i in range(rf.MAX_SEARCH_RESULTS + 20)]}}
+        self.assertEqual(len(rf.normalize_search(payload)), rf.MAX_SEARCH_RESULTS)
+
+    def test_media_per_item_is_capped(self):
+        body = " ".join("![gif](giphy|id%d)" % i for i in range(rf.MAX_MEDIA + 6))
+        _, media = rf.extract_media(body)
+        self.assertEqual(len(media), rf.MAX_MEDIA)
+
+
+class TestSeenFileSafety(unittest.TestCase):
+    """The cache lives at a predictable path, so a link planted there must not
+    decide what this reads or where it writes."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def test_a_symlink_is_not_read_through(self):
+        secret = os.path.join(self.dir.name, "secret.json")
+        with open(secret, "w") as fh:
+            json.dump({"seen": ["LEAKED"]}, fh)
+        link = os.path.join(self.dir.name, "cache.json")
+        os.symlink(secret, link)
+        self.assertEqual(rf.load_seen(link), [])
+
+    def test_a_symlink_target_is_not_written_through(self):
+        victim = os.path.join(self.dir.name, "victim")
+        with open(victim, "w") as fh:
+            fh.write("important")
+        link = os.path.join(self.dir.name, "cache.json")
+        os.symlink(victim, link)
+        try:
+            rf.save_seen(link, ["x"])
+        except OSError:
+            pass
+        with open(victim) as fh:
+            self.assertEqual(fh.read(), "important")
+
+    def test_the_cache_is_private(self):
+        path = os.path.join(self.dir.name, "sub", "seen.json")
+        rf.save_seen(path, ["a"])
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(os.path.dirname(path)).st_mode & 0o777, 0o700)
+
+    def test_a_directory_in_the_way_is_not_read(self):
+        path = os.path.join(self.dir.name, "adir")
+        os.mkdir(path)
+        self.assertEqual(rf.load_seen(path), [])
 
 
 class TestLinkDomain(unittest.TestCase):
@@ -392,8 +549,8 @@ class TestMediaEmbeds(unittest.TestCase):
         self.assertEqual(text, "")
 
     def test_a_plain_url_target_is_drawable(self):
-        _, media = rf.extract_media("![x](https://e.com/a.png)")
-        self.assertEqual(media, [{"url": "https://e.com/a.png",
+        _, media = rf.extract_media("![x](https://i.redd.it/a.png)")
+        self.assertEqual(media, [{"url": "https://i.redd.it/a.png",
                                   "kind": "image"}])
 
     def test_duplicates_are_drawn_once(self):
@@ -424,8 +581,8 @@ class TestPreviewImage(unittest.TestCase):
 
     def post(self, widths):
         return {"preview": {"images": [{
-            "source": {"url": "https://e/src.jpg", "width": 4000, "height": 3000},
-            "resolutions": [{"url": "https://e/%d.jpg" % w, "width": w,
+            "source": {"url": "https://i.redd.it/src.jpg", "width": 4000, "height": 3000},
+            "resolutions": [{"url": "https://i.redd.it/%d.jpg" % w, "width": w,
                              "height": w // 2} for w in widths]}]}}
 
     def test_picks_the_smallest_rendition_wide_enough(self):
@@ -436,7 +593,7 @@ class TestPreviewImage(unittest.TestCase):
         self.assertEqual(rf.preview_image(self.post([108, 216, 320]))["width"], 320)
 
     def test_falls_back_to_source_when_there_are_no_renditions(self):
-        self.assertEqual(rf.preview_image(self.post([]))["url"], "https://e/src.jpg")
+        self.assertEqual(rf.preview_image(self.post([]))["url"], "https://i.redd.it/src.jpg")
 
     def test_unordered_resolutions_still_pick_correctly(self):
         self.assertEqual(
@@ -459,9 +616,9 @@ class TestGallery(unittest.TestCase):
                                        for i in range(count)]},
             "media_metadata": {
                 "m%d" % i: {"status": status, "e": "Image",
-                            "s": {"u": "https://e/m%d-src.png" % i,
+                            "s": {"u": "https://i.redd.it/m%d-src.png" % i,
                                   "x": 4000, "y": 2000},
-                            "p": [{"u": "https://e/m%d-%d.png" % (i, w),
+                            "p": [{"u": "https://i.redd.it/m%d-%d.png" % (i, w),
                                    "x": w, "y": w // 2} for w in widths]}
                 for i in range(count)},
         }
@@ -469,8 +626,8 @@ class TestGallery(unittest.TestCase):
     def test_every_image_in_order(self):
         images = rf.gallery_images(self.gallery(3))
         self.assertEqual([i["url"] for i in images],
-                         ["https://e/m0-640.png", "https://e/m1-640.png",
-                          "https://e/m2-640.png"])
+                         ["https://i.redd.it/m0-640.png", "https://i.redd.it/m1-640.png",
+                          "https://i.redd.it/m2-640.png"])
 
     def test_carries_dimensions_for_aspect_ratio(self):
         image = rf.gallery_images(self.gallery(1))[0]
@@ -478,7 +635,7 @@ class TestGallery(unittest.TestCase):
 
     def test_falls_back_to_source_without_renditions(self):
         image = rf.gallery_images(self.gallery(1, widths=()))[0]
-        self.assertEqual(image["url"], "https://e/m0-src.png")
+        self.assertEqual(image["url"], "https://i.redd.it/m0-src.png")
 
     def test_invalid_entries_are_skipped(self):
         self.assertEqual(rf.gallery_images(self.gallery(2, status="invalid")), [])
@@ -491,11 +648,11 @@ class TestGallery(unittest.TestCase):
 
     def test_post_images_falls_back_to_the_single_preview(self):
         plain = {"preview": {"images": [{
-            "source": {"url": "https://e/s.jpg", "width": 900, "height": 600},
-            "resolutions": [{"url": "https://e/640.jpg", "width": 640,
+            "source": {"url": "https://i.redd.it/s.jpg", "width": 900, "height": 600},
+            "resolutions": [{"url": "https://i.redd.it/640.jpg", "width": 640,
                              "height": 420}]}]}}
         self.assertEqual(rf.post_images(plain),
-                         [{"url": "https://e/640.jpg", "width": 640,
+                         [{"url": "https://i.redd.it/640.jpg", "width": 640,
                            "height": 420}])
 
     def test_a_post_with_neither_has_no_images(self):
@@ -577,23 +734,23 @@ class TestAvatars(unittest.TestCase):
         self.assertIn("ids=t2_a,t2_b", calls[0])
 
     def test_avatars_land_on_every_matching_comment(self):
-        self.patch_curl({"t2_a": {"profile_img": "https://e/a.png"},
-                         "t2_b": {"profile_img": "https://e/b.png"}})
+        self.patch_curl({"t2_a": {"profile_img": "https://i.redd.it/a.png"},
+                         "t2_b": {"profile_img": "https://i.redd.it/b.png"}})
         comments = self.comments()
         rf.attach_avatars(comments, {})
         self.assertEqual([c["avatar"] for c in comments],
-                         ["https://e/a.png", "https://e/b.png",
-                          "https://e/a.png", ""])
+                         ["https://i.redd.it/a.png", "https://i.redd.it/b.png",
+                          "https://i.redd.it/a.png", ""])
 
     def test_html_escaped_urls_are_unescaped(self):
         # This endpoint escapes its URLs regardless of raw_json, and the &amp;
         # invalidates the signed query -- Reddit answers 403 for the image.
         self.patch_curl({"t2_a": {"profile_img":
-            "https://e/a.png?width=256&amp;s=abc&amp;crop=1"}})
+            "https://i.redd.it/a.png?width=256&amp;s=abc&amp;crop=1"}})
         comments = [{"authorId": "t2_a", "avatar": ""}]
         rf.attach_avatars(comments, {})
         self.assertEqual(comments[0]["avatar"],
-                         "https://e/a.png?width=256&s=abc&crop=1")
+                         "https://i.redd.it/a.png?width=256&s=abc&crop=1")
 
     def test_a_failed_lookup_does_not_lose_the_thread(self):
         # An avatar is decoration; the comments matter.
